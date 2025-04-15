@@ -2,91 +2,134 @@
 
 namespace App\Services;
 
-use App\Models\Product;
-use Illuminate\Http\UploadedFile;
-use Illuminate\Support\Facades\Storage;
 use App\Jobs\SendPriceChangeNotification;
+use App\Repositories\ProductRepository;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use MongoDB\Laravel\Eloquent\Model;
 
 class ProductService
 {
+    protected ProductRepository $repository;
+
+    public function __construct(ProductRepository $repository)
+    {
+        $this->repository = $repository;
+    }
+
+    /**
+     * Get all products
+     *
+     * @return \Illuminate\Database\Eloquent\Collection
+     */
     public function getAllProducts()
     {
-        return Product::all();
+        return $this->repository->all();
     }
 
-    public function findProduct(int $id): ?Product
+    /**
+     * Create a new product
+     *
+     * @param array $data
+     * @param UploadedFile|null $image
+     * @return Model
+     */
+    public function createProduct(array $data, ?UploadedFile $image = null): Model
     {
-        return Product::findOrFail($id);
-    }
-
-    public function createProduct(array $data, ?UploadedFile $image = null): Product
-    {
-        $product = Product::create([
-            'name' => $data['name'],
-            'description' => $data['description'] ?? null,
-            'price' => $data['price']
-        ]);
-
         if ($image) {
-            $product->image = $this->handleImageUpload($image);
-            $product->save();
+            $data['image'] = $this->handleImageUpload($image);
+        } else {
+            $data['image'] = 'product-placeholder.jpg';
         }
 
-        return $product;
+        return $this->repository->create($data);
     }
 
-    public function updateProduct(Product $product, array $data, ?UploadedFile $image = null): Product
+    /**
+     * Update a product
+     *
+     * @param string $id
+     * @param array $data
+     * @param UploadedFile|null $image
+     * @return bool
+     */
+    public function updateProduct(string $id, array $data, ?UploadedFile $image = null): bool
     {
+        $product = $this->repository->find($id);
+        if (!$product) {
+            return false;
+        }
+
         $oldPrice = $product->price;
 
-        $product->fill([
-            'name' => $data['name'],
-            'description' => $data['description'] ?? $product->description,
-            'price' => $data['price'] ?? $product->price
-        ]);
-
         if ($image) {
-            $this->deleteOldImage($product->image);
-            $product->image = $this->handleImageUpload($image);
+            $data['image'] = $this->handleImageUpload($image);
+            // Delete old image if it exists and is not the placeholder
+            if ($product->image && $product->image !== 'product-placeholder.jpg') {
+                Storage::delete($product->image);
+            }
         }
 
-        $product->save();
+        $updated = $this->repository->update($id, $data);
 
-        if ($oldPrice != $product->price) {
-            $this->notifyPriceChange($product, $oldPrice);
+        if ($updated && isset($data['price']) && $oldPrice != $data['price']) {
+            $this->notifyPriceChange($product, $oldPrice, $data['price']);
         }
 
-        return $product;
+        return $updated;
     }
 
-    public function deleteProduct(Product $product): void
+    /**
+     * Delete a product
+     *
+     * @param string $id
+     * @return bool
+     */
+    public function deleteProduct(string $id): bool
     {
-        $this->deleteOldImage($product->image);
-        $product->delete();
-    }
-
-    private function handleImageUpload(UploadedFile $file): string
-    {
-        $filename = uniqid() . '_' . time() . '.' . $file->getClientOriginalExtension();
-        $path = $file->storeAs('public/uploads', $filename);
-        return Storage::url($path);
-    }
-
-    private function deleteOldImage(?string $imagePath): void
-    {
-        if ($imagePath && $imagePath !== 'product-placeholder.jpg') {
-            Storage::delete(str_replace('/storage', 'public', $imagePath));
+        $product = $this->repository->find($id);
+        if (!$product) {
+            return false;
         }
+
+        // Delete product image if it exists and is not the placeholder
+        if ($product->image && $product->image !== 'product-placeholder.jpg') {
+            Storage::delete($product->image);
+        }
+
+        return $this->repository->delete($id);
     }
 
-    private function notifyPriceChange(Product $product, float $oldPrice): void
+    /**
+     * Handle image upload
+     *
+     * @param UploadedFile $image
+     * @return string
+     */
+    protected function handleImageUpload(UploadedFile $image): string
+    {
+        $filename = time() . '_' . uniqid() . '.' . $image->getClientOriginalExtension();
+        $path = $image->storeAs('uploads', $filename, 'public');
+        return $path;
+    }
+
+    /**
+     * Notify about price change
+     *
+     * @param Model $product
+     * @param float $oldPrice
+     * @param float $newPrice
+     * @return void
+     */
+    protected function notifyPriceChange(Model $product, float $oldPrice, float $newPrice): void
     {
         try {
             SendPriceChangeNotification::dispatch(
                 $product,
                 $oldPrice,
-                $product->price,
-                config('app.price_notification_email', 'admin@example.com')
+                $newPrice,
+                config('app.price_notification_email')
             );
         } catch (\Exception $e) {
             Log::error('Failed to dispatch price change notification: ' . $e->getMessage());
